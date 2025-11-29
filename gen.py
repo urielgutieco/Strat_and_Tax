@@ -7,14 +7,11 @@ from flask_cors import CORS
 from docx import Document
 from docx.shared import Inches
 
-# Nuevas importaciones para Google Drive
-import pickle
-import json
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from google.auth.transport.requests import Request
+# ----------------- Drive con SERVICE ACCOUNT (compatible con Vercel) -----------------
+from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+# -------------------------------------------------------------------------------------
 
 app = Flask(__name__)
 CORS(app)
@@ -24,16 +21,11 @@ TEMPLATE_FOLDER = 'template_word'
 GENERATED_DOCS = 'template_gendocs'
 GENERATED_ZIPS = 'template_genzips'
 
-# Si modificas el alcance de acceso (SCOPE), borra el archivo token.pickle
-SCOPES = ['https://www.googleapis.com/auth/drive.file']
-TOKEN_FILE = 'token.pickle'
-CREDENTIALS_FILE = 'credentials.json'
-
 os.makedirs(TEMPLATE_FOLDER, exist_ok=True)
 os.makedirs(GENERATED_DOCS, exist_ok=True)
 os.makedirs(GENERATED_ZIPS, exist_ok=True)
 
-# Mapeo: valor del select -> subcarpeta en template_word
+# Mapeo servicio → carpeta
 SERVICIO_TO_DIR = {
     "Servicios de construccion de unidades unifamiliares": "construccion_unifamiliar",
     "Servicios de reparacion o ampliacion o remodelacion de viviendas unifamiliares": "reparacion_remodelacion_unifamiliar",
@@ -44,7 +36,7 @@ SERVICIO_TO_DIR = {
     "Servicio de construccion de casas unifamiliares nuevas": "construccion_unifamiliar_nueva",
     "Servicio de instalacion de casas unifamiliares prefabricadas": "instalacion_prefabricadas",
     "Servicio de construccion de casas en la ciudad o casas jardin unifamiliares nuevas": "construccion_casas_ciudad_jardin",
-    "Dasarrollo urbano": "desarrollo_urbano",  # coincide con el valor tal como está escrito
+    "Dasarrollo urbano": "desarrollo_urbano",
     "Servicio de planificacion de la ordenacion urbana": "planificacion_ordenacion_urbana",
     "Servicio de administracion de tierras urbanas": "administracion_tierras_urbanas",
     "Servicio de programacion de inversiones urbanas": "programacion_inversiones_urbanas",
@@ -61,7 +53,7 @@ SERVICIO_TO_DIR = {
     "Servicio de mantenimiento y reparacion de equipo pesado": "mantenimiento_reparacion_equipo_pesado",
 }
 
-# Plantillas (nombres comunes existentes en cada subcarpeta)
+# Plantillas
 TEMPLATE_FILES = [
     'plantilla_solicitud.docx',
     '2.docx',
@@ -92,15 +84,16 @@ def generate_single_document(template_filename, template_root, replacements, use
     document = Document(template_path)
     replace_text_in_document(document, replacements)
 
-    # Imagen del usuario (opcional)
+    # Imagen
     if user_image_path and os.path.exists(user_image_path):
         try:
-            # Es necesario asegurar que los párrafos se inserten en el lugar deseado
-            # Aquí se inserta la imagen al final del documento por defecto
             document.add_paragraph()
-            document.add_paragraph(data.get('nombre_completo_de_la_persona_que_firma_la_solicitud', 'N/A') if data else 'N/A')
+            document.add_paragraph(
+                data.get('nombre_completo_de_la_persona_que_firma_la_solicitud', 'N/A')
+                if data else 'N/A'
+            )
             document.add_picture(user_image_path, width=Inches(2.5))
-        except Exception:
+        except:
             document.add_paragraph("⚠ No se pudo insertar la imagen del usuario.")
     else:
         document.add_paragraph("⚠ Imagen de firma no encontrada en el servidor.")
@@ -110,59 +103,49 @@ def generate_single_document(template_filename, template_root, replacements, use
     buffer.seek(0)
     return buffer
 
-# Función ADICIONAL para manejar la autenticación y la carga a Drive
+# ------------------------ NUEVA FUNCIÓN PARA GOOGLE DRIVE (SERVICE ACCOUNT) ------------------------
+
 def authenticate_and_upload_to_drive(file_name, zip_buffer):
     """
-    Realiza la autenticación OAuth2 y sube el archivo ZIP a Google Drive.
+    Autenticación con Google Drive usando Service Account (compatible con Vercel)
     """
-    creds = None
-    # 1. Cargar credenciales guardadas
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, 'rb') as token:
-            creds = pickle.load(token)
-            
-    # 2. Manejar credenciales (refrescar o iniciar flujo)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            # Asegúrate de tener tu archivo credentials.json de Google Cloud Console
-            if not os.path.exists(CREDENTIALS_FILE):
-                print(f"Error: No se encontró el archivo de credenciales '{CREDENTIALS_FILE}'.")
-                return {"success": False, "message": "Falta el archivo de credenciales de Google Drive."}
-            
-            # Nota: Este flujo de InstalledAppFlow.run_local_server()
-            # funciona solo si el servidor Flask se ejecuta localmente y
-            # tiene acceso al navegador del usuario para el inicio de sesión.
-            flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_FILE, SCOPES)
-            creds = flow.run_local_server(port=0)
-            
-        # Guardar las credenciales para la próxima ejecución
-        with open(TOKEN_FILE, 'wb') as token:
-            pickle.dump(creds, token)
 
     try:
+        service_account_info = os.getenv("-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDAmGjF74jEfxg1\ngUF910V/BOg/rdKrLD8mfdcZ6Lr4cAu8B1zOTkzNSw1lmg1bA5W1ugNF7/YxGf/Z\nMMxkaSsme1WAUVgNe/dx7qPK8Q1wrCGiSFDnaEbd/uQH3/r6rfvlM0oUte9fs4ts\n6I9FsdQjwhmwMJzJgOld+Jbr/C+oGWJbv3y8J9iarkD5a1ZMKLx5ZiP1wJvd+wpC\n/DMnc3PLrA9tFc7pogPkwx6x6p34zG+n++1RKmmf225t0XHVgI7UqRr9tlqXYjC7\nowq5VfqWO8a5qY3YiaaB+gd/wQ+0ZNRna+8M89gJYZSBBNYPGl/E4Pj+Nud5zUSU\n/WS3id/lAgMBAAECggEAExiJeuavJtx7KALy3WlUyK1R4c54TuSKNmTPyQ/cSfnC\nEBiiyQnWb5x7bZGCtX17gJM689pBDMlJJt3BxkrvLleYOKrYEi4ycKd6sgqIjJ1k\nkFSfQPKD5Er7jRRWLDjH+wfE1pzbaR/COUAtxHlHUWxTY7bONOSFPv4A6NEOYJpH\npEJrw14vm/8lpJZes9Bgp0noXt0msNZlJk5n2FBIEqn837bO7tO1x1NtqMoMW9ng\n8f/zW0U3PlQOOMSRuW/pBYBnXKXkXFaqx0M+KH/h7gvQttFnhnoroy+glW3colSE\nL4cnKLeDP0wpC1bKsEsN+UrBsA9sSk1n9jKaduNmGQKBgQDobZXfrrNmX3/Ega06\nGIdmiSVbbIn587QoiMV3dalRuzTUKyKIfgpmjTGfhULdVhM80dYGKTRJrby3Fryy\nEJnp6KYxDhELkCeZwgdp9z3btqMamkTPhw12VOqm/h5D///SlO8tfCo30wZ9onVg\nbDVa0Rh35ZTWIEOaW07e0rTxWwKBgQDUIKqtIn6mnyQFV6xUsHmvJVZ3CHvUqJlh\nB69wVu+Lc+aVuWnpna331b95LXRpps+zv1dpHgLKULMkM0cUKB3IFkRvm3HlRz9a\nJjRGE7j//TuWWcZa4ral/2OJmE+WWpp80SyEbU3XutS7pXELTRk/t/NAI2JPXvyJ\nEaHj1fH3vwKBgQCzR6v+IGwiv/D2qyvqDveJ4KmfDmaTFSbWyUC/d1OGRodmTGtT\nqxzso2YubIT54yXtmNGkaO37EvboprIgC2wdH6XpWrdNGwFguWgslVfyfLrsjyga\nh0qcBr4E1yiTPQif7t9aT1blPnHYQJKXMIArL/PWr5CRZcufaWS5vP9y1wKBgHB6\nOcW/6qPy8iibCleFk6AZDjXjm7VxCJL4fj/0+ONau0Ncoxoqb5pgDjz0qytyNeO7\na1/jd9tK2xIw1lmLw+7aT8NWCxhlpOPqKgGWZ5vk7HmWdKSwXeS6/E5zIpA4zn2s\ndAxr4MCo4i/1U3GImgC9SxARMwme9gy/+rVSNhEFAoGAKR0JkhUX4hR60Yps9wvk\n16aFFR9acmEDDaMFgOGHT2E4sT6hlvsTvATcB+ik7+v5aZSjL+A8foQXhXWwjUlt\nwzEwe1CvH54075n/P3yySjiJW760SpNuQlXwdvHjoWg1ntKTB97EwyjlEge48W/s\neCBHYNWtJT4OYgPgGSDGR4Q=\n-----END PRIVATE KEY-----\n")
+
+        if not service_account_info:
+            return {"success": False, "message": "Falta variable de entorno GOOGLE_SERVICE_ACCOUNT_JSON"}
+
+        creds = Credentials.from_service_account_info(
+            eval(service_account_info),
+            scopes=["https://www.googleapis.com/auth/drive.file"]
+        )
+
         service = build('drive', 'v3', credentials=creds)
-        
-        # Metadata del archivo
-        file_metadata = {'name': file_name}
-        
-        # **IMPORTANTE:** Rebobinamos el buffer al inicio antes de la carga.
+
+        # Metadata
+        file_metadata = {
+            'name': file_name
+        }
+
         zip_buffer.seek(0)
-        
-        # El MediaIoBaseUpload toma el objeto io.BytesIO como medio
         media = MediaIoBaseUpload(zip_buffer, mimetype='application/zip', resumable=True)
-        
-        # Llama a la API para cargar el archivo
-        file = service.files().create(body=file_metadata,
-                                      media_body=media,
-                                      fields='id').execute()
-        
-        return {"success": True, "message": f"Archivo cargado a Google Drive con éxito. ID: {file.get('id')}"}
+
+        uploaded_file = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id'
+        ).execute()
+
+        return {
+            "success": True,
+            "message": f"Archivo subido correctamente. ID: {uploaded_file.get('id')}"
+        }
 
     except Exception as e:
-        # Aquí puedes manejar errores específicos de la API (p.ej. cuota)
-        return {"success": False, "message": f"Error al cargar a Google Drive: {str(e)}"}
+        return {"success": False, "message": f"Error al subir a Drive: {str(e)}"}
+
+# -----------------------------------------------------------------------------------------------
 
 
 @app.route('/generate-word', methods=['POST'])
@@ -172,24 +155,22 @@ def generate_word():
 
         uploaded_image = request.files.get("imagen_usuario")
         user_image_path = None
+
         if uploaded_image:
-            # Guardamos la imagen temporalmente para que docx la pueda leer
             user_image_path = os.path.join(TEMPLATE_FOLDER, "imagen_custom.png")
             uploaded_image.save(user_image_path)
 
         if not data:
             return jsonify({"error": "No data received"}), 400
 
-        # Limpieza de generated_docs (opcional, se mantiene del código original)
         for filename in os.listdir(GENERATED_DOCS):
             file_path = os.path.join(GENERATED_DOCS, filename)
             try:
                 if os.path.isfile(file_path):
                     os.remove(file_path)
             except Exception as e:
-                print(f"Error al eliminar el archivo {file_path}: {e}")
+                print(f"Error al eliminar {file_path}: {e}")
 
-        # Servicio seleccionado y carpeta asociada
         servicio = data.get('servicio')
         if not servicio:
             return jsonify({"error": "Debes seleccionar un servicio."}), 400
@@ -198,15 +179,11 @@ def generate_word():
         if not carpeta_servicio:
             return jsonify({"error": f"No existe carpeta mapeada para el servicio: {servicio}"}), 404
 
-        # Root dinámico de plantillas según servicio
         template_root = os.path.join(TEMPLATE_FOLDER, carpeta_servicio)
         if not os.path.isdir(template_root):
             return jsonify({"error": f"La carpeta de plantillas no existe: {template_root}"}), 404
 
-        # Número de contrato único
         numero_de_contrato_unico = ''.join([str(random.randint(0, 9)) for _ in range(18)])
-
-        # Forzar la descripción del servicio desde el select
         descripcion_servicio = servicio
 
         replacements = {
@@ -232,20 +209,20 @@ def generate_word():
         }
 
         zip_buffer = io.BytesIO()
+
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
             for template in TEMPLATE_FILES:
                 try:
                     doc_buffer = generate_single_document(template, template_root, replacements, user_image_path, data)
                     base = os.path.splitext(template)[0]
 
-                    # Nombre de salida legible
                     rfc = data.get('r_f_c', 'N/A')
                     output_filename = f"{base}_{descripcion_servicio}_{base}_{numero_de_contrato_unico}_{rfc}.docx"
 
                     output_path = os.path.join(GENERATED_DOCS, output_filename)
                     if os.path.exists(output_path):
                         os.remove(output_path)
-                    
+
                     with open(output_path, "wb") as f:
                         f.write(doc_buffer.getvalue())
 
@@ -256,23 +233,21 @@ def generate_word():
                     continue
 
         zip_buffer.seek(0)
+
         final_zip_name = f"{descripcion_servicio}_{numero_de_contrato_unico}_{data.get('r_f_c', 'N/A')}.zip"
 
-        # Guardado local del ZIP
         zip_server_path = os.path.join(GENERATED_ZIPS, final_zip_name)
-        with open(zip_server_path, "wb") as zip_file_for_storage:
-            zip_file_for_storage.write(zip_buffer.getvalue())
-        
-        # Lógica ADICIONAL: Llamar a la función para subir el archivo a Google Drive
-        # Nota: Volvemos a posicionar el buffer al inicio antes de la carga a Drive
-        zip_buffer.seek(0) 
+        with open(zip_server_path, "wb") as zip_disk:
+            zip_disk.write(zip_buffer.getvalue())
+
+        # ---------- SUBIR A DRIVE ----------
+        zip_buffer.seek(0)
         upload_result = authenticate_and_upload_to_drive(final_zip_name, zip_buffer)
-        
-        # El mensaje de Google Drive se imprimirá en la consola del servidor (terminal)
-        print(f"Resultado de la carga a Google Drive: {upload_result['message']}")
-        
-        # Volvemos a posicionar el buffer al inicio antes de enviarlo al cliente (descarga)
-        zip_buffer.seek(0) 
+
+        print(f"GOOGLE DRIVE: {upload_result['message']}")
+
+        zip_buffer.seek(0)
+
         return send_file(
             zip_buffer,
             mimetype='application/zip',
@@ -283,11 +258,6 @@ def generate_word():
     except Exception as e:
         return jsonify({"error": f"Error interno: {str(e)}"}), 500
 
+
 if __name__ == '__main__':
-    try:
-        # Nota: Para que la autenticación de Drive funcione,
-        # necesitarás tener el archivo 'credentials.json' en el mismo directorio
-        # y la primera ejecución abrirá una ventana del navegador para iniciar sesión.
-        app.run(debug=True, port=5001)
-    except Exception as e:
-        print(f"Error al iniciar la aplicación: {e}")
+    app.run(debug=True, port=5001)
