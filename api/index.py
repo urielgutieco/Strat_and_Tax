@@ -9,6 +9,7 @@ import tempfile
 import pathlib
 import re
 import bcrypt
+import jwt
 from flask import Flask, request, send_file, jsonify, abort
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -19,6 +20,11 @@ from docx.shared import Inches
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
+
+#Implementacion de Seguridad
+from datetime import datetime, timedelta, timezone 
+from functools import wraps # Necesaria para el decorador
+from flask import Flask, request, send_file, jsonify, abort
 
 # -------------------------
 # Config / Producción-safe
@@ -44,70 +50,19 @@ else:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("generate-word-app")
 
-# Aquí pones la contraseña que LE VAS A DAR a la usuaria (Ej: "ContraseñaProd123")
-password_plano = b"u12345G" 
-# Nota: La 'b' convierte la cadena a bytes, lo que requiere bcrypt.
+# -------------------------
+# Configuración de Seguridad JWT y Usuarios 🔑 (Agregado)
+# -------------------------
+# Clave secreta: OBLIGATORIO usar una variable de entorno en Vercel
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "TU_CLAVE_SECRETA_POR_DEFECTO_Y_SECRETA") 
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRATION_HOURS = 24 # Token expira en 24 horas
 
-# Generar el hash seguro
-hashed_password = bcrypt.hashpw(password_plano, bcrypt.gensalt())
-
-# Imprimir el hash para copiarlo
-print(hashed_password.decode('utf-8'))
-# Ubicación: Dentro de api/index.py
-
-# Base de datos de usuarios con HASHES de contraseñas
+# Base de datos de usuarios con HASHES de contraseñas (solo los hashes)
 USER_DB = {
     "nombre_administrador_seguro": b"$2b$12$tUa5Z8rF.E.q2H/i.q5U7.G.R6A1W9V4P3I0Y2X5Q8T7S6R5C4V", 
-    
-    # 🎯 Aquí pegas el hash generado en el paso 2
     "nombre_de_la_usuaria_prod": b"$2b$12$hGq9p0aQ4w7xS2zV.B.c.8A.D.E.F3G4H5I6J7K8L9M0N1O2P3Q4", 
 }
-
-# Ubicación: En api/index.py, después de la sección de Configuración de Seguridad.
-
-@app.route('/login', methods=['POST'])
-def login():
-    """
-    Verifica las credenciales utilizando bcrypt para comparar la contraseña ingresada
-    con el hash almacenado en USER_DB. Si son válidas, emite un token JWT.
-    """
-    try:
-        data = request.get_json()
-        username = data.get('username')
-        password = data.get('password')
-
-        if not username or not password:
-            return jsonify({"error": "Falta usuario o contraseña"}), 400
-
-        # Obtener el hash almacenado del usuario (ya debe estar en formato bytes: b'...')
-        stored_hash = USER_DB.get(username) 
-
-        # 1. Verificar credenciales con bcrypt.checkpw
-        # bcrypt.checkpw requiere que tanto la contraseña ingresada como el hash 
-        # almacenado sean bytes (password.encode('utf-8') y stored_hash, respectivamente).
-        if stored_hash and bcrypt.checkpw(password.encode('utf-8'), stored_hash):
-            
-            # 2. Generar Token JWT (Autenticación exitosa)
-            expiration_time = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRATION_HOURS)
-            payload = {
-                'sub': username, 
-                'exp': expiration_time,
-                'iat': datetime.now(timezone.utc)
-            }
-            token = jwt.encode(payload, JWT_SECRET_KEY, algorithm=JWT_ALGORITHM)
-
-            return jsonify({
-                "message": "Login exitoso",
-                "token": token
-            }), 200
-        else:
-            # Fallo si el usuario no existe O el hash no coincide
-            return jsonify({"error": "Usuario o contraseña inválidos"}), 401
-
-    except Exception as e:
-        logger.error("Error inesperado en login: %s", e)
-        return jsonify({"error": "Error interno del servidor durante el login"}), 500
-
 
 # Carpetas raíz (no usadas en serverless pero se mantienen por compatibilidad)
 BASE_DIR = pathlib.Path(os.getenv("BASE_DIR", "."))
@@ -283,12 +238,40 @@ def authenticate_and_upload_to_drive(file_name, zip_buffer):
         logger.exception("Error al subir a Drive: %s", e)
         return {"success": False, "message": f"Error al subir a Drive: {str(e)}"}
     
+    # Ubicación: Antes de la función generate_word()
+
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        # Obtener el token del encabezado Authorization (Bearer <token>)
+        auth_header = request.headers.get('Authorization')
+        if auth_header and auth_header.startswith('Bearer '):
+            token = auth_header.split(' ')[1]
+
+        if not token:
+            return jsonify({'error': 'Token de acceso faltante. Inicia sesión.'}), 403
+
+        try:
+            # Decodificar y verificar el token
+            data = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+            current_user = data['sub']
+        except jwt.ExpiredSignatureError:
+            return jsonify({'error': 'Token expirado. Vuelve a iniciar sesión.'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'error': 'Token inválido o manipulado.'}), 403
+
+        # Pasa el usuario autenticado a la función generate_word
+        return f(current_user, *args, **kwargs)
+    return decorated    
 
 # ------------------------
 # Endpoint principal (misma ruta y flujo)
 # ------------------------
 @app.route('/generate-word', methods=['POST'])
-def generate_word():
+@token_required # <-- APLICACIÓN DEL DECORADOR
+def generate_word(current_user): # <-- DEBE ACEPTAR EL current_user
+    logger.info("Generación de documentos iniciada por usuario: %s", current_user) # Opcional: log del usuario
     try:
         # form y archivos
         data = request.form.to_dict()
